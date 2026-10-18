@@ -30,14 +30,67 @@ public enum TaskProcessorError: Error, Equatable {
 }
 
 public actor TaskProcessor {
+    private let maximumConcurrency: Int
+    
     public init(maximumConcurrency: Int) throws {
-        fatalError("Implement Homework 2")
+        guard maximumConcurrency > 0 else { throw TaskProcessorError.nonPositiveMaximumConcurrency }
+        self.maximumConcurrency = maximumConcurrency
     }
 
-    public func process(
-        _ jobs: [Job],
-        worker: @escaping @Sendable (Job) async throws -> Int
-    ) async throws -> [JobResult] {
-        fatalError("Implement Homework 2")
+    public func process(_ jobs: [Job], worker: @escaping @Sendable (Job) async throws -> Int) async throws -> [JobResult] {
+        guard !jobs.isEmpty else {return []}
+        
+        var seen = Set<String>()
+        
+        for j in jobs {
+            if !seen.insert(j.id).inserted {
+                throw TaskProcessorError.duplicateID(j.id)
+            }
+        }
+        
+        let outcomes = await withTaskGroup(of: (Int, JobOutcome).self, returning: [JobOutcome?].self) { group in
+            var results = [JobOutcome?](repeating: nil, count: jobs.count)
+            var nextIndex = 0
+            
+            while nextIndex < min(maximumConcurrency, jobs.count) {
+                let index = nextIndex
+                let job = jobs[index]
+                let started = group.addTaskUnlessCancelled {await (index, Self.processChild(of: job, using: worker))}
+                guard started else {break}
+                nextIndex += 1
+            }
+            
+            while let (finishedIndex, outcome) = await group.next() {
+                results[finishedIndex] = outcome
+                
+                if Task.isCancelled {
+                    group.cancelAll()
+                    continue
+                }
+                
+                if nextIndex < jobs.count {
+                    let index = nextIndex
+                    let job = jobs[index]
+                    let started = group.addTaskUnlessCancelled {await (index, Self.processChild(of: job, using: worker))}
+                    if started { nextIndex += 1}
+                }
+            }
+            
+            return results
+        }
+        
+        return zip(jobs, outcomes).map { job, outcome in
+            JobResult(id: job.id, outcome: outcome ?? .cancelled)
+        }
+    }
+    
+    private static func processChild(of job: Job, using worker: @Sendable (Job) async throws -> Int) async -> JobOutcome {
+        do {
+            return .succeeded(try await worker(job))
+        } catch is CancellationError {
+            return .cancelled
+        } catch {
+            return .failed
+        }
     }
 }
